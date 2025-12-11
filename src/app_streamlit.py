@@ -1,132 +1,204 @@
 # src/app_streamlit.py
 import streamlit as st
+from pathlib import Path
 import pandas as pd
 import numpy as np
-from pathlib import Path
 import joblib
-import plotly.express as px
-import plotly.graph_objects as go
 
-ROOT = Path.cwd()
-FEATURES_PATH = ROOT / "data" / "features.csv"
-MODEL_PATH = ROOT / "models" / "xgb_model.pkl"
-IMPORTANCES_PATH = ROOT / "reports" / "feature_importances.csv"
+# -----------------------
+# Paths / constants
+# -----------------------
+THIS = Path(__file__).resolve()
+# If repository layout is repo_root/src/app_streamlit.py -> ROOT = parents[1]
+ROOT = THIS.parents[1]
+DATA_DIR = ROOT / "data"
+MODELS_DIR = ROOT / "models"
 
-st.set_page_config(page_title="Crypto Volatility Demo", layout="wide")
+FEATURES_CSV = DATA_DIR / "features.csv"
+RF_JOBLIB = MODELS_DIR / "rf_model.joblib"
+XGB_JOBLIB = MODELS_DIR / "xgb_model.joblib"
 
-@st.cache_data(show_spinner=False)
-def load_features():
-    if not FEATURES_PATH.exists():
-        raise FileNotFoundError(f"Features file not found at {FEATURES_PATH}")
-    df = pd.read_csv(FEATURES_PATH, parse_dates=["date"])
+# -----------------------
+# Load data + models
+# -----------------------
+@st.cache_data(ttl=3600)
+def load_data():
+    if not FEATURES_CSV.exists():
+        st.error(f"Features file not found: {FEATURES_CSV}")
+        return pd.DataFrame()
+    df = pd.read_csv(FEATURES_CSV, parse_dates=["date"], infer_datetime_format=True, low_memory=False)
     return df
 
-@st.cache_resource(show_spinner=False)
-def load_model():
-    if not MODEL_PATH.exists():
-        return None
-    return joblib.load(MODEL_PATH)
+@st.cache_resource
+def load_models():
+    rf = None
+    xgb_model = None
 
-@st.cache_data(show_spinner=False)
-def load_importances():
-    if IMPORTANCES_PATH.exists():
-        return pd.read_csv(IMPORTANCES_PATH)
-    return None
-
-def predict_for_row(model, row_df, feature_cols):
-    X = row_df[feature_cols]
-    pred = model.predict(X)[0]
-    return float(pred)
-
-def main():
-    st.title("Crypto Volatility Forecast — Demo")
-    st.markdown(
-        "Simple demo: predict **30-day rolling volatility** using the trained XGBoost model."
-    )
-
-    # Load assets
-    df = load_features()
-    model = load_model()
-    imp_df = load_importances()
-
-    if model is None:
-        st.warning(f"Model not found at: {MODEL_PATH}. Train the model and place it there.")
-        st.stop()
-
-    symbols = sorted(df["symbol"].unique())
-    col1, col2 = st.columns([1, 3])
-
-    with col1:
-        st.subheader("Select inputs")
-        symbol = st.selectbox("Symbol", symbols, index=symbols.index("Bitcoin") if "Bitcoin" in symbols else 0)
-        available_dates = df[df["symbol"] == symbol]["date"].sort_values().dt.date.unique()
-        date = st.selectbox("Date", available_dates[::-1])  # latest first
-
-        st.write("")  # spacing
-        if st.button("Predict for chosen date"):
-            # find the exact row (date as datetime)
-            date_str = pd.to_datetime(str(date)).strftime("%Y-%m-%d")
-            row = df[(df["symbol"] == symbol) & (df["date"].dt.strftime("%Y-%m-%d") == date_str)]
-            if row.empty:
-                st.error("No data row found for that symbol/date.")
-            else:
-                # determine feature columns (all numeric columns except target)
-                drop_cols = {"symbol", "date", "volatility_30d"}
-                feature_cols = [c for c in row.columns if c not in drop_cols and pd.api.types.is_numeric_dtype(row[c])]
-                # align single-row DF
-                pred = predict_for_row(model, row, feature_cols)
-                st.success(f"Predicted 30-day volatility: **{pred:.6f}**")
-                # show actual if available
-                actual = row["volatility_30d"].iloc[0]
-                st.info(f"Actual 30-day volatility (from features file): **{actual:.6f}**")
-                # show the features used
-                st.subheader("Feature snapshot (selected row)")
-                # show only top features to keep UI tidy
-                display_cols = feature_cols[:20]
-                st.dataframe(row[display_cols].T, use_container_width=True)
-
-                # allow download
-                result = row[display_cols].copy()
-                result["predicted_volatility_30d"] = pred
-                csv_bytes = result.to_csv(index=False).encode()
-                st.download_button("Download prediction CSV", csv_bytes, file_name=f"{symbol}_{date_str}_prediction.csv")
-
-    with col2:
-        st.subheader("Recent Price & Volatility history")
-        # prepare time series for symbol
-        sym_df = df[df["symbol"] == symbol].sort_values("date")
-        # price chart
-        fig_price = px.line(sym_df, x="date", y="close", title=f"{symbol} — Close Price", labels={"close":"Close"})
-        fig_price.update_layout(margin=dict(t=40,l=0,r=0,b=0))
-        st.plotly_chart(fig_price, use_container_width=True)
-
-        # volatility overlays
-        vol_cols = [c for c in ["volatility_7d","volatility_14d","volatility_30d"] if c in sym_df.columns]
-        if vol_cols:
-            fig_vol = go.Figure()
-            for c in vol_cols:
-                fig_vol.add_trace(go.Scatter(x=sym_df["date"], y=sym_df[c], mode="lines", name=c))
-            fig_vol.update_layout(title=f"{symbol} — Rolling Volatility", yaxis_title="Volatility", margin=dict(t=40,l=0,r=0,b=0))
-            st.plotly_chart(fig_vol, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Model & Feature Insights")
-    st.write(f"Model file loaded from: `{MODEL_PATH}`")
-    if imp_df is not None:
-        st.markdown("**Top features (sample):**")
-        # show top 10 by RF importance if present
-        if {"feature","rf_importance"}.issubset(set(imp_df.columns)):
-            st.dataframe(imp_df.sort_values("rf_importance", ascending=False).head(10).reset_index(drop=True))
-        else:
-            st.dataframe(imp_df.head(10))
+    if RF_JOBLIB.exists():
+        try:
+            rf = joblib.load(RF_JOBLIB)
+            st.write(f"Loaded RandomForest from: {RF_JOBLIB.name}")
+        except Exception as e:
+            st.error(f"Failed to load RandomForest ({RF_JOBLIB.name}): {e}")
     else:
-        st.info("Feature importances not found.")
+        st.warning(f"RandomForest model file not found at: {RF_JOBLIB}")
 
-    st.markdown("### Notes")
-    st.markdown(
-        "- This demo uses the precomputed feature row from `data/features.csv`. The model expects the exact same preprocessing/columns as used during training.\n"
-        "- If prediction fails, ensure your `models/xgb_model.pkl` and `data/features.csv` are present and consistent with the training pipeline."
-    )
+    if XGB_JOBLIB.exists():
+        try:
+            xgb_model = joblib.load(XGB_JOBLIB)
+            st.write(f"Loaded XGBoost from: {XGB_JOBLIB.name}")
+        except Exception as e:
+            st.error(f"Failed to load XGBoost ({XGB_JOBLIB.name}): {e}")
+    else:
+        st.warning(f"XGBoost model file not found at: {XGB_JOBLIB}")
 
-if __name__ == "__main__":
-    main()
+    return rf, xgb_model
+
+# -----------------------
+# App UI
+# -----------------------
+st.set_page_config(page_title="Crypto Volatility Predictor", layout="wide")
+st.title("📈 Crypto Volatility Prediction Demo")
+st.write("Predict next-day crypto volatility using trained ML models.")
+
+df = load_data()
+rf, xgb_model = load_models()
+
+if df.empty:
+    st.stop()
+
+# symbol selector
+symbols = sorted(df["symbol"].unique().tolist())
+symbol = st.selectbox("Select a cryptocurrency:", symbols)
+
+symbol_df = df[df["symbol"] == symbol].sort_values("date")
+if symbol_df.empty:
+    st.warning("No data for selected symbol.")
+    st.stop()
+
+latest = symbol_df.iloc[[-1]].copy()  # keep as DataFrame (single row)
+
+# show latest features
+st.subheader("Latest Available Features")
+st.dataframe(latest.reset_index(drop=True))
+
+# -----------------------
+# Prepare input & predict
+# -----------------------
+# Determine canonical model feature names (prefer RF's stored names)
+model_feature_names = None
+if rf is not None and hasattr(rf, "feature_names_in_"):
+    model_feature_names = list(rf.feature_names_in_)
+elif xgb_model is not None and hasattr(xgb_model, "feature_names_in_"):
+    model_feature_names = list(xgb_model.feature_names_in_)
+else:
+    # fallback: numeric columns in the dataset excluding common non-features
+    model_feature_names = [
+        c for c in df.select_dtypes(include=[np.number]).columns
+        if c not in ("volatility_30d", "symbol", "date", "timestamp")
+    ]
+    st.warning("Could not read feature_names from models; using fallback numeric columns.")
+
+st.write(f"Model expects {len(model_feature_names)} features.")
+
+# Build single-row input aligned to expected features
+row = latest.copy()
+
+# Drop timestamp column (models expect numeric only)
+if "timestamp" in row.columns:
+    row = row.drop(columns=["timestamp"])
+
+# Drop target column if present
+if "volatility_30d" in row.columns:
+    row = row.drop(columns=["volatility_30d"])
+
+# Ensure each expected column exists; create NaN where missing
+for col in model_feature_names:
+    if col not in row.columns:
+        row[col] = np.nan
+
+# Ensure 'close' present if model expects it — use latest or NaN fallback
+if "close" in model_feature_names and "close" not in row.columns:
+    try:
+        last_close = symbol_df["close"].iloc[-1]
+        row["close"] = last_close
+    except Exception:
+        row["close"] = np.nan
+
+# Select columns in exact order
+X_input = row[model_feature_names].copy()
+
+# Coerce to numeric (non-numeric -> NaN)
+for c in X_input.columns:
+    X_input[c] = pd.to_numeric(X_input[c], errors="coerce")
+
+# Fill NaNs: prefer symbol-specific median, then global median, then 0.0
+for c in X_input.columns:
+    if X_input[c].isna().any():
+        fill_val = None
+        if c in symbol_df.columns and pd.api.types.is_numeric_dtype(symbol_df[c]):
+            fill_val = symbol_df[c].median()
+        if fill_val is None and c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+            fill_val = df[c].median()
+        if fill_val is None or (pd.isna(fill_val)):
+            fill_val = 0.0
+        X_input[c] = X_input[c].fillna(fill_val)
+
+# Final dtype check
+non_numeric_after = [c for c in X_input.columns if not pd.api.types.is_numeric_dtype(X_input[c])]
+if non_numeric_after:
+    st.error("Prepared input still contains non-numeric columns: " + ", ".join(non_numeric_after))
+else:
+    st.info("Prepared input features (sent to models).")
+    with st.expander("Show input features sent to model", expanded=False):
+        # show transposed table so it's easier to read single-row
+        st.dataframe(X_input.T)
+
+# --- Predictions ---
+rf_pred = None
+xgb_pred = None
+
+# RF predict
+if rf is not None:
+    try:
+        rf_pred = rf.predict(X_input)[0]
+    except Exception as e:
+        st.error("RandomForest prediction failed: " + str(e))
+        # helpful debugging hints
+        try:
+            expected = list(rf.feature_names_in_)
+            provided = list(X_input.columns)
+            missing = [c for c in expected if c not in provided]
+            extra = [c for c in provided if c not in expected]
+            if missing:
+                st.write("Missing features required by RF (sample):", missing[:20])
+            if extra:
+                st.write("Extra features provided (sample):", extra[:20])
+        except Exception:
+            pass
+
+# XGBoost predict
+if xgb_model is not None:
+    try:
+        xgb_pred = xgb_model.predict(X_input)[0]
+    except Exception as e:
+        st.error("XGBoost prediction failed: " + str(e))
+        # show dtypes for diagnosis
+        dtypes = X_input.dtypes.astype(str).to_dict()
+        st.write("Input column dtypes sent to XGBoost (sample):")
+        st.write({k: dtypes[k] for k in list(dtypes)[:12]})
+
+# Show results
+st.subheader("Predicted Volatility")
+if rf_pred is not None:
+    st.write(f"**RandomForest:** {rf_pred:.5f}")
+else:
+    st.write("RandomForest: not available")
+
+if xgb_pred is not None:
+    st.write(f"**XGBoost:** {xgb_pred:.5f}")
+else:
+    st.write("XGBoost: not available")
+
+st.markdown("---")
+st.caption("Note: These are demo model outputs. Do not use for live trading decisions.")

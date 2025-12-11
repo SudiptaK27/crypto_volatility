@@ -1,16 +1,23 @@
+# src/model.py
 import time
-import os
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+import pandas as pd
+import joblib
+import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import xgboost as xgb
-import joblib
+from sklearn.model_selection import train_test_split
 
-ROOT = Path.cwd()
+# ----------------- Paths (robust) -----------------
+THIS = Path(__file__).resolve()
+# If file is inside /src, project root is parent of parent; else fallback to cwd
+if THIS.parts[-2] == "src":
+    ROOT = THIS.parents[1]
+else:
+    ROOT = Path.cwd()
+
 FEATURES = ROOT / "data" / "features.csv"
 MODELS_DIR = ROOT / "models"
 REPORTS_DIR = ROOT / "reports"
@@ -19,6 +26,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ----------------- Data loading / prep -----------------
 def load_data():
     df = pd.read_csv(FEATURES, parse_dates=["date"])
     df = df.sort_values(["symbol", "date"])
@@ -74,6 +82,7 @@ def prepare_xy(df, target="volatility_30d", clip_extreme=False, clip_value=1e6):
     return X_clean, y_clean
 
 
+# ----------------- Models -----------------
 def run_random_forest(X_train, X_test, y_train, y_test):
     rf = RandomForestRegressor(
         n_estimators=200,
@@ -126,14 +135,31 @@ def run_xgboost(X_train, X_test, y_train, y_test):
     }
 
 
+# ----------------- Save artifacts -----------------
 def save_models_and_metrics(rf_res, xgb_res, X_columns):
-    # Save models
-    rf_path = MODELS_DIR / "rf_model.pkl"
-    xgb_path = MODELS_DIR / "xgb_model.pkl"
-    joblib.dump(rf_res["model"], rf_path)
-    joblib.dump(xgb_res["model"], xgb_path)
-    print("Saved RF model to:", rf_path)
-    print("Saved XGB model to:", xgb_path)
+    # Save models robustly:
+    rf_joblib_path = MODELS_DIR / "rf_model.joblib"
+    xgb_json_path = MODELS_DIR / "xgb_model.json"
+    xgb_joblib_path = MODELS_DIR / "xgb_model.joblib"  # fallback if JSON save fails
+
+    # RandomForest -> joblib (recommended)
+    joblib.dump(rf_res["model"], rf_joblib_path)
+    print("Saved RF model (joblib) to:", rf_joblib_path)
+
+    # XGBoost -> native JSON using sklearn API .save_model()
+    try:
+        # if it's an instance of XGBRegressor from sklearn API:
+        if hasattr(xgb_res["model"], "save_model"):
+            xgb_res["model"].save_model(str(xgb_json_path))
+            print("Saved XGBoost model (JSON) to:", xgb_json_path)
+        else:
+            # fallback to joblib
+            joblib.dump(xgb_res["model"], xgb_joblib_path)
+            print("Saved XGBoost model (joblib fallback) to:", xgb_joblib_path)
+    except Exception as e:
+        print("XGBoost JSON save failed, falling back to joblib. Error:", e)
+        joblib.dump(xgb_res["model"], xgb_joblib_path)
+        print("Saved XGBoost model (joblib) to:", xgb_joblib_path)
 
     # Save metrics CSV
     metrics = pd.DataFrame([
@@ -156,30 +182,40 @@ def save_models_and_metrics(rf_res, xgb_res, X_columns):
     metrics.to_csv(metrics_path, index=False)
     print("Saved metrics to:", metrics_path)
 
-    # Feature importances (top 10) from RF and XGB
+    # Feature importances (attempt both rf and xgb)
     try:
-        rf_imp = rf_res["model"].feature_importances_
-        xgb_imp = xgb_res["model"].feature_importances_
         feats = list(X_columns)
-        imp_df = pd.DataFrame({
-            "feature": feats,
-            "rf_importance": rf_imp,
-            "xgb_importance": xgb_imp
-        }).sort_values(by="rf_importance", ascending=False)
+        rf_imp = getattr(rf_res["model"], "feature_importances_", None)
+        xgb_imp = getattr(xgb_res["model"], "feature_importances_", None)
 
+        imp_df = pd.DataFrame({"feature": feats})
+
+        if rf_imp is not None and len(rf_imp) == len(feats):
+            imp_df["rf_importance"] = rf_imp
+        else:
+            imp_df["rf_importance"] = np.nan
+            print("Warning: RF importances missing or length mismatch; filling NaN.")
+
+        if xgb_imp is not None and len(xgb_imp) == len(feats):
+            imp_df["xgb_importance"] = xgb_imp
+        else:
+            imp_df["xgb_importance"] = np.nan
+            print("Warning: XGB importances missing or length mismatch; filling NaN.")
+
+        # sort by RF importance for display (fallback behavior)
         print("\nTop 10 features by RandomForest importance:")
-        print(imp_df[["feature", "rf_importance"]].head(10).to_string(index=False))
+        print(imp_df.sort_values("rf_importance", ascending=False).head(10).to_string(index=False))
 
         print("\nTop 10 features by XGBoost importance:")
-        print(imp_df.sort_values("xgb_importance", ascending=False)[["feature", "xgb_importance"]].head(10).to_string(index=False))
+        print(imp_df.sort_values("xgb_importance", ascending=False).head(10).to_string(index=False))
 
-        # Save importance table
         imp_df.to_csv(REPORTS_DIR / "feature_importances.csv", index=False)
         print("Saved feature importances to:", REPORTS_DIR / "feature_importances.csv")
     except Exception as e:
-        print("Could not compute feature importances:", e)
+        print("Could not compute/save feature importances:", e)
 
 
+# ----------------- Main -----------------
 def main():
     df = load_data()
     X, y = prepare_xy(df, clip_extreme=False)
