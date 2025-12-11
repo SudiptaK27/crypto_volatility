@@ -1,0 +1,19 @@
+# Python virtual env
+crypto-env/
+
+# Bytecode / caches
+*.pyc
+__pycache__/
+
+# Ignore big artifacts by default (remove lines if you want to include small examples)
+*.pkl
+*.csv
+
+# macOS
+.DS_Store
+
+# VS Code workspace
+.vscode/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
