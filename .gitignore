@@ -17,3 +17,7 @@ __pycache__/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+models/
+*.joblib
+*.pkl
